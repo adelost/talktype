@@ -1,7 +1,7 @@
 """Tests for sentence-boundary chunking logic."""
 from dataclasses import dataclass
 from bdd_pytest import unit, scenario, expect
-from chunking import find_last_sentence_boundary
+from talktype.chunking import find_last_sentence_boundary
 
 
 @dataclass

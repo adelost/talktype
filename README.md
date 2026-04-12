@@ -1,5 +1,8 @@
 # talktype
 
+[![tests](https://github.com/adelost/talktype/actions/workflows/test.yml/badge.svg)](https://github.com/adelost/talktype/actions)
+[![PyPI](https://img.shields.io/pypi/v/talktype)](https://pypi.org/project/talktype/)
+
 Hold a key, speak, release. Text appears at your cursor.
 
 Works in any app — editor, browser, terminal, chat. The key is suppressed at the OS level so it never triggers anything in the active window.
