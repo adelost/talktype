@@ -27,6 +27,21 @@ export OPENAI_API_KEY=sk-proj-...
 python voice_type.py
 ```
 
+Or add a `talktype` command to your PowerShell profile so you can start/stop it from anywhere:
+
+```powershell
+# Add to $PROFILE:
+function talktype {
+    $script = 'E:\src\voice-type\voice_type.py'
+    $running = Get-Process -Name python -ErrorAction SilentlyContinue |
+        Where-Object { (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine -like '*voice_type*' }
+    if ($running) { $running | Stop-Process -Force; Write-Host 'talktype stopped' }
+    else { & python $script }
+}
+```
+
+Then just type `talktype` to start, `talktype` again to stop, or `Ctrl+C` in the terminal.
+
 - **F9** (hold) — start recording
 - **F9** (release) — transcribe and type at cursor
 - **Ctrl+C** — quit
