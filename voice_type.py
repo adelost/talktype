@@ -41,36 +41,27 @@ logging.basicConfig(
 log = logging.getLogger("talktype")
 
 
-# --- Audio feedback ---
+# --- Audio feedback (piano-like WAV tones via winsound) ---
 
-def _play_tone(freq, duration_ms=80, volume=0.15, fade_ms=15):
-    """Play a soft sine tone via sounddevice. Non-blocking."""
+SOUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
+SOUND_ENABLED = True  # set to False to disable all sounds
+
+def _play_wav(name):
+    """Play a WAV file from sounds/ dir. Non-blocking, no conflict with recording."""
+    if not SOUND_ENABLED:
+        return
     def _do():
         try:
-            sr = 22050
-            samples = int(sr * duration_ms / 1000)
-            t = np.linspace(0, duration_ms / 1000, samples, endpoint=False)
-            tone = (np.sin(2 * np.pi * freq * t) * volume).astype(np.float32)
-            fade = int(sr * fade_ms / 1000)
-            if fade > 0 and len(tone) > fade * 2:
-                tone[:fade] *= np.linspace(0, 1, fade, dtype=np.float32)
-                tone[-fade:] *= np.linspace(1, 0, fade, dtype=np.float32)
-            sd.play(tone, samplerate=sr, blocking=True)
+            import winsound
+            path = os.path.join(SOUNDS_DIR, name)
+            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
         except Exception:
             pass
     threading.Thread(target=_do, daemon=True).start()
 
-
-def beep_start():
-    """Start beep uses winsound (not sounddevice) to avoid conflict with
-    the active recording InputStream. sd.play during recording is silent."""
-    if sys.platform == "win32":
-        threading.Thread(target=lambda: __import__("winsound").Beep(660, 80), daemon=True).start()
-    else:
-        _play_tone(660, 60, 0.12)
-
-def beep_done():  _play_tone(520, 50, 0.10); _play_tone(660, 70, 0.12)
-def beep_error(): _play_tone(280, 150, 0.15)
+def beep_start(): _play_wav("start.wav")
+def beep_done():  _play_wav("done.wav")
+def beep_error(): _play_wav("error.wav")
 
 
 # --- UI ---
