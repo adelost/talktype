@@ -19,6 +19,21 @@ import sounddevice as sd
 import keyboard
 from openai import OpenAI
 
+try:
+    import winsound
+    def beep_start(): winsound.Beep(800, 80)
+    def beep_done():  winsound.Beep(600, 80); winsound.Beep(800, 80)
+    def beep_error(): winsound.Beep(300, 200)
+except ImportError:
+    # Not on Windows — silent
+    def beep_start(): pass
+    def beep_done():  pass
+    def beep_error(): pass
+
+def set_title(text):
+    if sys.platform == "win32":
+        os.system(f"title {text}")
+
 # --- Config ---
 
 HOTKEY = "f9"  # suppressed — apps never see it, no focus steal
@@ -87,6 +102,8 @@ def start_recording():
 
         active_recording = session
 
+    set_title("talktype [RECORDING]")
+    beep_start()
     log.info("recording...")
 
 
@@ -119,6 +136,7 @@ def stop_recording():
 
 
 def transcribe_and_type(audio):
+    set_title("talktype [transcribing...]")
     duration = len(audio) / SAMPLE_RATE
     log.info("transcribing %.1fs...", duration)
 
@@ -149,9 +167,13 @@ def transcribe_and_type(audio):
         # "first sentence." + " " + "second sentence."
         keyboard.write(text + " ")
         log.info("typed %d chars", len(text))
+        beep_done()
+        set_title("talktype")
 
     except Exception as e:
         log.error("transcription failed: %s", e)
+        beep_error()
+        set_title("talktype")
 
 
 def transcribe_worker():
@@ -178,6 +200,7 @@ def main():
         log.error("OPENAI_API_KEY is not set.")
         raise SystemExit(1)
 
+    set_title("talktype")
     log.info("Voice Type ready. Hold %s to record, release to transcribe.", HOTKEY.upper())
     log.info("Ctrl+C to quit.")
     log.info("Language: %s | Model: whisper-1 | Log: %s", LANGUAGE, LOG_FILE)
