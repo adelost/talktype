@@ -140,15 +140,15 @@ def find_last_sentence_boundary(words):
     """
     last_boundary_idx = -1
     for i, w in enumerate(words):
-        word_text = w.get("word", "").strip()
+        word_text = (w.word if hasattr(w, "word") else w.get("word", "")).strip()
         if word_text and word_text[-1] in SENTENCE_ENDS:
             last_boundary_idx = i
 
     if last_boundary_idx == -1:
         return None
 
-    text = " ".join(w["word"].strip() for w in words[:last_boundary_idx + 1])
-    cut_time = words[last_boundary_idx]["end"]
+    text = " ".join((w.word if hasattr(w, "word") else w.get("word", "")).strip() for w in words[:last_boundary_idx + 1])
+    cut_time = words[last_boundary_idx].end if hasattr(words[last_boundary_idx], "end") else words[last_boundary_idx]["end"]
     return text, cut_time
 
 
