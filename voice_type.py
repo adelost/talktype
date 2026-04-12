@@ -133,23 +133,42 @@ def transcribe_with_timestamps(audio):
     return result
 
 
-def find_last_sentence_boundary(words):
+def find_last_sentence_boundary(words, full_text):
     """
-    Find the last word that ends a sentence (word ending with . ? !).
+    Find the last sentence boundary in the transcription.
+
+    Whisper's word objects DON'T include punctuation (word="videon" even
+    when full text says "videon!"), so we search the full text for sentence
+    endings, count words up to that point, and look up the timestamp from
+    the words array.
+
     Returns (text_up_to_boundary, cut_timestamp) or None if no boundary.
     """
-    last_boundary_idx = -1
-    for i, w in enumerate(words):
-        word_text = (w.word if hasattr(w, "word") else w.get("word", "")).strip()
-        if word_text and word_text[-1] in SENTENCE_ENDS:
-            last_boundary_idx = i
-
-    if last_boundary_idx == -1:
+    if not words or not full_text:
         return None
 
-    text = " ".join((w.word if hasattr(w, "word") else w.get("word", "")).strip() for w in words[:last_boundary_idx + 1])
-    cut_time = words[last_boundary_idx].end if hasattr(words[last_boundary_idx], "end") else words[last_boundary_idx]["end"]
-    return text, cut_time
+    # Find the last sentence-ending punctuation followed by a space or end
+    last_boundary_pos = -1
+    for i, ch in enumerate(full_text):
+        if ch in SENTENCE_ENDS:
+            last_boundary_pos = i
+
+    if last_boundary_pos == -1:
+        return None
+
+    text_up_to = full_text[:last_boundary_pos + 1].strip()
+    if not text_up_to:
+        return None
+
+    # Count words in the sliced text to find the corresponding word index
+    word_count = len(text_up_to.split())
+    word_idx = min(word_count - 1, len(words) - 1)
+
+    if word_idx < 0:
+        return None
+
+    cut_time = words[word_idx].end if hasattr(words[word_idx], "end") else words[word_idx]["end"]
+    return text_up_to, cut_time
 
 
 # --- Chunk streaming logic ---
@@ -186,7 +205,7 @@ def process_chunk(is_final=False):
             return
 
         # Mid-stream: find last sentence boundary
-        boundary = find_last_sentence_boundary(words)
+        boundary = find_last_sentence_boundary(words, full_text)
         if boundary is None:
             # No complete sentence yet — wait for more audio
             log.info("chunk: no sentence boundary yet, waiting... (%s)", full_text[:60])
