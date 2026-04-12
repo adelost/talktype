@@ -52,9 +52,15 @@ def _play_wav(name):
         return
     def _do():
         try:
-            import winsound
             path = os.path.join(SOUNDS_DIR, name)
-            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+            if sys.platform == "win32":
+                import winsound
+                winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+            else:
+                import wave as _wave
+                with _wave.open(path) as wf:
+                    data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+                    sd.play(data.astype(np.float32) / 32768, samplerate=wf.getframerate(), blocking=True)
         except Exception:
             pass
     threading.Thread(target=_do, daemon=True).start()

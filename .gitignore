@@ -4,3 +4,4 @@ __pycache__/
 test_deps.py
 test_hotkey.py
 test_words.py
+talktype.egg-info/
