@@ -1,5 +1,4 @@
 sounddevice
 openai
-pynput
+keyboard
 numpy
-pyperclip
