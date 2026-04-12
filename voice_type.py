@@ -19,16 +19,28 @@ import sounddevice as sd
 import keyboard
 from openai import OpenAI
 
-try:
-    import winsound
-    def beep_start(): winsound.Beep(800, 80)
-    def beep_done():  winsound.Beep(600, 80); winsound.Beep(800, 80)
-    def beep_error(): winsound.Beep(300, 200)
-except ImportError:
-    # Not on Windows — silent
-    def beep_start(): pass
-    def beep_done():  pass
-    def beep_error(): pass
+# --- Audio feedback (soft tones, not harsh system beeps) ---
+
+def _play_tone(freq, duration_ms=80, volume=0.15, fade_ms=15):
+    """Play a soft sine tone via sounddevice. Non-blocking."""
+    def _do():
+        try:
+            sr = 22050
+            t = np.linspace(0, duration_ms / 1000, int(sr * duration_ms / 1000), endpoint=False)
+            tone = (np.sin(2 * np.pi * freq * t) * volume).astype(np.float32)
+            # Fade in/out to avoid click
+            fade = int(sr * fade_ms / 1000)
+            if fade > 0 and len(tone) > fade * 2:
+                tone[:fade] *= np.linspace(0, 1, fade, dtype=np.float32)
+                tone[-fade:] *= np.linspace(1, 0, fade, dtype=np.float32)
+            sd.play(tone, samplerate=sr, blocking=True)
+        except Exception:
+            pass
+    threading.Thread(target=_do, daemon=True).start()
+
+def beep_start(): _play_tone(660, 60, 0.12)
+def beep_done():  _play_tone(520, 50, 0.10); _play_tone(660, 70, 0.12)
+def beep_error(): _play_tone(280, 150, 0.15)
 
 def set_title(text):
     if sys.platform == "win32":
