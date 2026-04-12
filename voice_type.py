@@ -23,7 +23,7 @@ from openai import OpenAI
 HOTKEY = "f9"
 SAMPLE_RATE = 16000
 CHANNELS = 1
-LANGUAGE = "sv"
+LANGUAGE = None  # None = auto-detect. Set to "sv", "en" etc. to force a language
 SILENCE_THRESHOLD = 300
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_type.log")
 
@@ -109,12 +109,10 @@ def is_silence(audio):
 
 def transcribe(client, audio):
     """Send audio to Whisper API, return text."""
-    result = client.audio.transcriptions.create(
-        model="whisper-1",
-        file=audio_to_wav(audio),
-        language=LANGUAGE,
-        response_format="text",
-    )
+    kwargs = dict(model="whisper-1", file=audio_to_wav(audio), response_format="text")
+    if LANGUAGE:
+        kwargs["language"] = LANGUAGE
+    result = client.audio.transcriptions.create(**kwargs)
     return result.strip()
 
 
