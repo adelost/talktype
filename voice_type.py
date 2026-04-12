@@ -61,7 +61,14 @@ def _play_tone(freq, duration_ms=80, volume=0.15, fade_ms=15):
     threading.Thread(target=_do, daemon=True).start()
 
 
-def beep_start(): _play_tone(660, 60, 0.12)
+def beep_start():
+    """Start beep uses winsound (not sounddevice) to avoid conflict with
+    the active recording InputStream. sd.play during recording is silent."""
+    if sys.platform == "win32":
+        threading.Thread(target=lambda: __import__("winsound").Beep(660, 80), daemon=True).start()
+    else:
+        _play_tone(660, 60, 0.12)
+
 def beep_done():  _play_tone(520, 50, 0.10); _play_tone(660, 70, 0.12)
 def beep_error(): _play_tone(280, 150, 0.15)
 
