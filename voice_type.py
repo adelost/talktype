@@ -21,32 +21,7 @@ import numpy as np
 import sounddevice as sd
 import keyboard
 from openai import OpenAI
-
-# --- Audio feedback (soft tones via sounddevice) ---
-
-def _play_tone(freq, duration_ms=80, volume=0.15, fade_ms=15):
-    def _do():
-        try:
-            sr = 22050
-            t = np.linspace(0, duration_ms / 1000, int(sr * duration_ms / 1000), endpoint=False)
-            tone = (np.sin(2 * np.pi * freq * t) * volume).astype(np.float32)
-            fade = int(sr * fade_ms / 1000)
-            if fade > 0 and len(tone) > fade * 2:
-                tone[:fade] *= np.linspace(0, 1, fade, dtype=np.float32)
-                tone[-fade:] *= np.linspace(1, 0, fade, dtype=np.float32)
-            sd.play(tone, samplerate=sr, blocking=True)
-        except Exception:
-            pass
-    threading.Thread(target=_do, daemon=True).start()
-
-def beep_start(): _play_tone(660, 60, 0.12)
-def beep_chunk(): _play_tone(520, 40, 0.08)
-def beep_done():  _play_tone(520, 50, 0.10); _play_tone(660, 70, 0.12)
-def beep_error(): _play_tone(280, 150, 0.15)
-
-def set_title(text):
-    if sys.platform == "win32":
-        os.system(f"title {text}")
+from chunking import find_last_sentence_boundary
 
 # --- Config ---
 
@@ -54,8 +29,8 @@ HOTKEY = "f9"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 LANGUAGE = "sv"
-CHUNK_INTERVAL_S = 5       # send to Whisper every N seconds while held
-OVERLAP_S = 0.3            # audio overlap between chunks to avoid cut words
+CHUNK_INTERVAL_S = 5
+OVERLAP_S = 0.3
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_type.log")
 
 # --- Logging ---
@@ -71,40 +46,85 @@ logging.basicConfig(
 )
 log = logging.getLogger("talktype")
 
-# --- State ---
 
-_api_key = os.environ.get("OPENAI_API_KEY", "").strip().strip('"').strip("'")
-client = OpenAI(api_key=_api_key)
-lock = threading.Lock()
-recording = False
-frames = []           # raw int16 audio frames (appended by callback)
-stream = None
-chunk_timer = None     # periodic timer thread
+# --- Audio feedback (soft sine tones, not system beeps) ---
+
+def _play_tone(freq, duration_ms=80, volume=0.15, fade_ms=15):
+    """Play a soft sine tone via sounddevice. Non-blocking."""
+    def _do():
+        try:
+            sr = 22050
+            samples = int(sr * duration_ms / 1000)
+            t = np.linspace(0, duration_ms / 1000, samples, endpoint=False)
+            tone = (np.sin(2 * np.pi * freq * t) * volume).astype(np.float32)
+            fade = int(sr * fade_ms / 1000)
+            if fade > 0 and len(tone) > fade * 2:
+                tone[:fade] *= np.linspace(0, 1, fade, dtype=np.float32)
+                tone[-fade:] *= np.linspace(1, 0, fade, dtype=np.float32)
+            sd.play(tone, samplerate=sr, blocking=True)
+        except Exception:
+            pass
+    threading.Thread(target=_do, daemon=True).start()
 
 
-# --- Audio helpers ---
-
-def frames_to_audio():
-    """Snapshot current frames as a numpy array."""
-    with lock:
-        if not frames:
-            return None
-        return np.concatenate(frames, axis=0)
+def beep_start(): _play_tone(660, 60, 0.12)
+def beep_done():  _play_tone(520, 50, 0.10); _play_tone(660, 70, 0.12)
+def beep_error(): _play_tone(280, 150, 0.15)
 
 
-def trim_frames_to(keep_samples):
-    """Remove all frames except the last `keep_samples` worth of audio."""
-    with lock:
-        if not frames:
-            return
-        all_audio = np.concatenate(frames, axis=0)
-        if keep_samples <= 0 or keep_samples >= len(all_audio):
-            return
-        frames.clear()
-        frames.append(all_audio[-keep_samples:])
+# --- UI helpers ---
 
+def set_title(text):
+    """Set console window title (visible in taskbar). Uses ctypes to avoid
+    os.system('title ...') which spawns cmd.exe and can steal focus."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleTitleW(text)
+        except Exception:
+            pass
+
+
+# --- Audio buffer ---
+
+class AudioBuffer:
+    """Thread-safe audio frame buffer with snapshot + trim operations."""
+
+    def __init__(self):
+        self._frames = []
+        self._lock = threading.Lock()
+
+    def append(self, frame):
+        with self._lock:
+            self._frames.append(frame.copy())
+
+    def snapshot(self):
+        """Return all buffered audio as a single numpy array, or None."""
+        with self._lock:
+            if not self._frames:
+                return None
+            return np.concatenate(self._frames, axis=0)
+
+    def trim_to(self, keep_samples):
+        """Keep only the last N samples, discard the rest."""
+        with self._lock:
+            if not self._frames:
+                return
+            audio = np.concatenate(self._frames, axis=0)
+            if keep_samples <= 0 or keep_samples >= len(audio):
+                return
+            self._frames.clear()
+            self._frames.append(audio[-keep_samples:])
+
+    def clear(self):
+        with self._lock:
+            self._frames.clear()
+
+
+# --- Transcription ---
 
 def audio_to_wav(audio):
+    """Convert int16 numpy audio to an in-memory WAV file."""
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(CHANNELS)
@@ -116,30 +136,32 @@ def audio_to_wav(audio):
     return buf
 
 
-# --- Transcription with word timestamps ---
-
-from chunking import find_last_sentence_boundary
-
-def transcribe_with_timestamps(audio):
-    """Send audio to Whisper, get back text + word-level timestamps."""
-    buf = audio_to_wav(audio)
-    result = client.audio.transcriptions.create(
+def transcribe(client, audio):
+    """Send audio to Whisper API, return result with word timestamps."""
+    return client.audio.transcriptions.create(
         model="whisper-1",
-        file=buf,
+        file=audio_to_wav(audio),
         language=LANGUAGE,
         response_format="verbose_json",
         timestamp_granularities=["word"],
     )
-    return result
 
 
-# --- Chunk streaming logic ---
+def type_text(text):
+    """Type text at cursor position via keyboard.write (SendInput)."""
+    keyboard.write(text + " ")
 
-def process_chunk(is_final=False):
-    """Transcribe current audio, type completed sentences, trim buffer."""
-    audio = frames_to_audio()
-    if audio is None or len(audio) < SAMPLE_RATE * 0.3:
-        # Less than 0.3s — not worth transcribing
+
+# --- Chunk processing (composed method) ---
+
+def process_chunk(client, buf, is_final=False):
+    """Transcribe buffered audio and type completed sentences.
+
+    For mid-stream chunks: finds the last sentence boundary, types up to
+    that point, and trims the buffer. For the final chunk: types everything.
+    """
+    audio = buf.snapshot()
+    if audio is None or not has_enough_audio(audio):
         return
 
     duration = len(audio) / SAMPLE_RATE
@@ -147,145 +169,160 @@ def process_chunk(is_final=False):
     log.info("chunk: transcribing %.1fs (final=%s)...", duration, is_final)
 
     try:
-        result = transcribe_with_timestamps(audio)
+        result = transcribe(client, audio)
+        text = (result.text or "").strip()
         words = getattr(result, "words", None) or []
-        full_text = (result.text or "").strip()
 
-        if not full_text:
+        if not text:
             log.warning("chunk: empty transcription")
             return
 
         if is_final:
-            # Final chunk: type everything, clear buffer
-            log.info("final: %s", full_text)
-            keyboard.write(full_text + " ")
-            log.info("typed %d chars", len(full_text))
-            with lock:
-                frames.clear()
-            beep_done()
-            set_title("talktype")
-            return
-
-        # Mid-stream: find last sentence boundary
-        boundary = find_last_sentence_boundary(words, full_text)
-        if boundary is None:
-            # No complete sentence yet — wait for more audio
-            log.info("chunk: no sentence boundary yet, waiting... (%s)", full_text[:60])
-            set_title("talktype [RECORDING]")
-            return
-
-        text, cut_time = boundary
-        log.info("chunk: sentence boundary at %.1fs: %s", cut_time, text)
-        keyboard.write(text + " ")
-        log.info("typed %d chars", len(text))
-        beep_chunk()
-
-        # Trim buffer: keep audio from cut_time onwards (with overlap)
-        keep_from = max(0, cut_time - OVERLAP_S)
-        keep_samples = int((duration - keep_from) * SAMPLE_RATE)
-        trim_frames_to(keep_samples)
-
-        set_title("talktype [RECORDING]")
+            type_final(text, buf)
+        else:
+            type_until_boundary(text, words, duration, buf)
 
     except Exception as e:
         log.error("chunk transcription failed: %s", e)
         beep_error()
-        set_title("talktype [RECORDING]" if recording else "talktype")
+        set_title("talktype [RECORDING]")
 
 
-def chunk_loop():
-    """Periodic timer that fires process_chunk while recording."""
-    while True:
-        time.sleep(CHUNK_INTERVAL_S)
-        with lock:
-            if not recording:
-                return
-        process_chunk(is_final=False)
+SILENCE_THRESHOLD = 300  # int16 peak amplitude below this = silence
+
+def has_enough_audio(audio):
+    """At least 0.3s of audio with actual speech (not silence).
+    Whisper hallucinates on silent audio ('Tack till elever...' etc.)."""
+    if len(audio) < SAMPLE_RATE * 0.3:
+        return False
+    peak = np.max(np.abs(audio))
+    if peak < SILENCE_THRESHOLD:
+        log.info("chunk: skipping silent audio (peak=%d)", peak)
+        return False
+    return True
 
 
-# --- Recording lifecycle ---
+def type_final(text, buf):
+    """Final chunk: type everything, clear buffer."""
+    log.info("final: %s", text)
+    type_text(text)
+    log.info("typed %d chars", len(text))
+    buf.clear()
+    beep_done()
+    set_title("talktype")
 
-def start_recording():
-    global recording, stream, chunk_timer
 
-    with lock:
-        if recording:
-            return
-        recording = True
-        frames.clear()
-
-    def callback(indata, frame_count, time_info, status):
-        if status:
-            log.warning("audio status: %s", status)
-        with lock:
-            frames.append(indata.copy())
-
-    try:
-        stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            callback=callback,
-        )
-        stream.start()
-    except Exception as e:
-        log.error("recording start failed: %s", e)
-        with lock:
-            recording = False
+def type_until_boundary(text, words, duration, buf):
+    """Mid-stream: type text up to the last sentence boundary, trim buffer."""
+    boundary = find_last_sentence_boundary(words, text)
+    if boundary is None:
+        log.info("chunk: no sentence boundary yet, waiting... (%s)", text[:60])
+        set_title("talktype [RECORDING]")
         return
 
-    # Start periodic chunk timer
-    chunk_timer = threading.Thread(target=chunk_loop, daemon=True)
-    chunk_timer.start()
+    sentence, cut_time = boundary
+    log.info("chunk: sentence boundary at %.1fs: %s", cut_time, sentence)
+    type_text(sentence)
+    log.info("typed %d chars", len(sentence))
 
+    keep_from = max(0, cut_time - OVERLAP_S)
+    keep_samples = int((duration - keep_from) * SAMPLE_RATE)
+    buf.trim_to(keep_samples)
     set_title("talktype [RECORDING]")
-    beep_start()
-    log.info("recording (streaming every %ds)...", CHUNK_INTERVAL_S)
 
 
-def stop_recording():
-    global recording, stream
+# --- Recording session ---
 
-    with lock:
-        if not recording:
-            return
-        recording = False
+class RecordingSession:
+    """Manages mic capture + periodic chunk streaming."""
 
-    if stream:
+    def __init__(self, client):
+        self._client = client
+        self._buf = AudioBuffer()
+        self._stream = None
+        self._active = False
+        self._lock = threading.Lock()
+
+    @property
+    def active(self):
+        return self._active
+
+    def start(self):
+        with self._lock:
+            if self._active:
+                return
+            self._active = True
+            self._buf.clear()
+
         try:
-            stream.stop()
-            stream.close()
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                callback=self._on_audio,
+            )
+            self._stream.start()
         except Exception as e:
-            log.warning("stream close failed: %s", e)
-        stream = None
+            log.error("recording start failed: %s", e)
+            with self._lock:
+                self._active = False
+            return
 
-    # Process whatever is left in the buffer as final chunk
-    threading.Thread(target=lambda: process_chunk(is_final=True), daemon=True).start()
+        threading.Thread(target=self._chunk_loop, daemon=True).start()
+        set_title("talktype [RECORDING]")
+        beep_start()
+        log.info("recording (streaming every %ds)...", CHUNK_INTERVAL_S)
 
+    def stop(self):
+        with self._lock:
+            if not self._active:
+                return
+            self._active = False
 
-# --- Hotkey ---
+        if self._stream:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception as e:
+                log.warning("stream close failed: %s", e)
+            self._stream = None
 
-def on_press(event):
-    start_recording()
+        threading.Thread(
+            target=lambda: process_chunk(self._client, self._buf, is_final=True),
+            daemon=True,
+        ).start()
 
-def on_release(event):
-    stop_recording()
+    def _on_audio(self, indata, frame_count, time_info, status):
+        if status:
+            log.warning("audio status: %s", status)
+        self._buf.append(indata)
+
+    def _chunk_loop(self):
+        while True:
+            time.sleep(CHUNK_INTERVAL_S)
+            if not self._active:
+                return
+            process_chunk(self._client, self._buf, is_final=False)
 
 
 # --- Main ---
 
 def main():
-    if not _api_key:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip().strip('"').strip("'")
+    if not api_key:
         log.error("OPENAI_API_KEY is not set.")
         raise SystemExit(1)
+
+    client = OpenAI(api_key=api_key)
+    session = RecordingSession(client)
 
     set_title("talktype")
     log.info("talktype ready. Hold %s to record, text streams as you speak.", HOTKEY.upper())
     log.info("Ctrl+C to quit.")
     log.info("Language: %s | Chunk: %ds | Log: %s", LANGUAGE, CHUNK_INTERVAL_S, LOG_FILE)
 
-    keyboard.on_press_key(HOTKEY, on_press, suppress=True)
-    keyboard.on_release_key(HOTKEY, on_release, suppress=True)
+    keyboard.on_press_key(HOTKEY, lambda _: session.start(), suppress=True)
+    keyboard.on_release_key(HOTKEY, lambda _: session.stop(), suppress=True)
 
     try:
         keyboard.wait("ctrl+c")
