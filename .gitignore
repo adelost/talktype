@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
 *.log
-test_*.py
+test_deps.py
+test_hotkey.py
+test_words.py
