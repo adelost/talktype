@@ -1,10 +1,7 @@
 """
-talktype — push-to-talk transcription with streaming.
+talktype — push-to-talk transcription.
 
-Hold F9 to record. While held, audio is transcribed in chunks every
-few seconds — text appears at your cursor as you speak. Release F9
-to flush the final chunk.
-
+Hold F9 to record, release to transcribe. Text appears at your cursor.
 Key is suppressed so apps never see it. Ctrl+C to quit.
 
 Requirements: pip install sounddevice openai keyboard numpy
@@ -13,7 +10,6 @@ Requirements: pip install sounddevice openai keyboard numpy
 import io
 import os
 import sys
-import time
 import wave
 import threading
 import logging
@@ -21,7 +17,6 @@ import numpy as np
 import sounddevice as sd
 import keyboard
 from openai import OpenAI
-from chunking import find_last_sentence_boundary
 
 # --- Config ---
 
@@ -29,8 +24,7 @@ HOTKEY = "f9"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 LANGUAGE = "sv"
-CHUNK_INTERVAL_S = 5
-OVERLAP_S = 0.3
+SILENCE_THRESHOLD = 300
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_type.log")
 
 # --- Logging ---
@@ -47,7 +41,7 @@ logging.basicConfig(
 log = logging.getLogger("talktype")
 
 
-# --- Audio feedback (soft sine tones, not system beeps) ---
+# --- Audio feedback ---
 
 def _play_tone(freq, duration_ms=80, volume=0.15, fade_ms=15):
     """Play a soft sine tone via sounddevice. Non-blocking."""
@@ -72,11 +66,10 @@ def beep_done():  _play_tone(520, 50, 0.10); _play_tone(660, 70, 0.12)
 def beep_error(): _play_tone(280, 150, 0.15)
 
 
-# --- UI helpers ---
+# --- UI ---
 
 def set_title(text):
-    """Set console window title (visible in taskbar). Uses ctypes to avoid
-    os.system('title ...') which spawns cmd.exe and can steal focus."""
+    """Set console window title via ctypes (no subprocess, no focus steal)."""
     if sys.platform == "win32":
         try:
             import ctypes
@@ -85,43 +78,7 @@ def set_title(text):
             pass
 
 
-# --- Audio buffer ---
-
-class AudioBuffer:
-    """Thread-safe audio frame buffer with snapshot + trim operations."""
-
-    def __init__(self):
-        self._frames = []
-        self._lock = threading.Lock()
-
-    def append(self, frame):
-        with self._lock:
-            self._frames.append(frame.copy())
-
-    def snapshot(self):
-        """Return all buffered audio as a single numpy array, or None."""
-        with self._lock:
-            if not self._frames:
-                return None
-            return np.concatenate(self._frames, axis=0)
-
-    def trim_to(self, keep_samples):
-        """Keep only the last N samples, discard the rest."""
-        with self._lock:
-            if not self._frames:
-                return
-            audio = np.concatenate(self._frames, axis=0)
-            if keep_samples <= 0 or keep_samples >= len(audio):
-                return
-            self._frames.clear()
-            self._frames.append(audio[-keep_samples:])
-
-    def clear(self):
-        with self._lock:
-            self._frames.clear()
-
-
-# --- Transcription ---
+# --- Audio helpers ---
 
 def audio_to_wav(audio):
     """Convert int16 numpy audio to an in-memory WAV file."""
@@ -136,123 +93,42 @@ def audio_to_wav(audio):
     return buf
 
 
+def is_silence(audio):
+    """True if audio is too quiet to contain speech."""
+    return np.max(np.abs(audio)) < SILENCE_THRESHOLD
+
+
+# --- Transcription ---
+
 def transcribe(client, audio):
-    """Send audio to Whisper API, return result with word timestamps."""
-    return client.audio.transcriptions.create(
+    """Send audio to Whisper API, return text."""
+    result = client.audio.transcriptions.create(
         model="whisper-1",
         file=audio_to_wav(audio),
         language=LANGUAGE,
-        response_format="verbose_json",
-        timestamp_granularities=["word"],
+        response_format="text",
     )
-
-
-def type_text(text):
-    """Type text at cursor position via keyboard.write (SendInput)."""
-    keyboard.write(text + " ")
-
-
-# --- Chunk processing (composed method) ---
-
-def process_chunk(client, buf, is_final=False):
-    """Transcribe buffered audio and type completed sentences.
-
-    For mid-stream chunks: finds the last sentence boundary, types up to
-    that point, and trims the buffer. For the final chunk: types everything.
-    """
-    audio = buf.snapshot()
-    if audio is None or not has_enough_audio(audio):
-        return
-
-    duration = len(audio) / SAMPLE_RATE
-    set_title(f"talktype [transcribing {duration:.0f}s...]")
-    log.info("chunk: transcribing %.1fs (final=%s)...", duration, is_final)
-
-    try:
-        result = transcribe(client, audio)
-        text = (result.text or "").strip()
-        words = getattr(result, "words", None) or []
-
-        if not text:
-            log.warning("chunk: empty transcription")
-            return
-
-        if is_final:
-            type_final(text, buf)
-        else:
-            type_until_boundary(text, words, duration, buf)
-
-    except Exception as e:
-        log.error("chunk transcription failed: %s", e)
-        beep_error()
-        set_title("talktype [RECORDING]")
-
-
-SILENCE_THRESHOLD = 300  # int16 peak amplitude below this = silence
-
-def has_enough_audio(audio):
-    """At least 0.3s of audio with actual speech (not silence).
-    Whisper hallucinates on silent audio ('Tack till elever...' etc.)."""
-    if len(audio) < SAMPLE_RATE * 0.3:
-        return False
-    peak = np.max(np.abs(audio))
-    if peak < SILENCE_THRESHOLD:
-        log.info("chunk: skipping silent audio (peak=%d)", peak)
-        return False
-    return True
-
-
-def type_final(text, buf):
-    """Final chunk: type everything, clear buffer."""
-    log.info("final: %s", text)
-    type_text(text)
-    log.info("typed %d chars", len(text))
-    buf.clear()
-    beep_done()
-    set_title("talktype")
-
-
-def type_until_boundary(text, words, duration, buf):
-    """Mid-stream: type text up to the last sentence boundary, trim buffer."""
-    boundary = find_last_sentence_boundary(words, text)
-    if boundary is None:
-        log.info("chunk: no sentence boundary yet, waiting... (%s)", text[:60])
-        set_title("talktype [RECORDING]")
-        return
-
-    sentence, cut_time = boundary
-    log.info("chunk: sentence boundary at %.1fs: %s", cut_time, sentence)
-    type_text(sentence)
-    log.info("typed %d chars", len(sentence))
-
-    keep_from = max(0, cut_time - OVERLAP_S)
-    keep_samples = int((duration - keep_from) * SAMPLE_RATE)
-    buf.trim_to(keep_samples)
-    set_title("talktype [RECORDING]")
+    return result.strip()
 
 
 # --- Recording session ---
 
 class RecordingSession:
-    """Manages mic capture + periodic chunk streaming."""
+    """Hold-to-record, release-to-transcribe."""
 
     def __init__(self, client):
         self._client = client
-        self._buf = AudioBuffer()
+        self._frames = []
         self._stream = None
         self._active = False
         self._lock = threading.Lock()
-
-    @property
-    def active(self):
-        return self._active
 
     def start(self):
         with self._lock:
             if self._active:
                 return
             self._active = True
-            self._buf.clear()
+            self._frames.clear()
 
         try:
             self._stream = sd.InputStream(
@@ -268,16 +144,17 @@ class RecordingSession:
                 self._active = False
             return
 
-        threading.Thread(target=self._chunk_loop, daemon=True).start()
         set_title("talktype [RECORDING]")
         beep_start()
-        log.info("recording (streaming every %ds)...", CHUNK_INTERVAL_S)
+        log.info("recording...")
 
     def stop(self):
         with self._lock:
             if not self._active:
                 return
             self._active = False
+            audio = np.concatenate(self._frames, axis=0) if self._frames else None
+            self._frames.clear()
 
         if self._stream:
             try:
@@ -287,22 +164,50 @@ class RecordingSession:
                 log.warning("stream close failed: %s", e)
             self._stream = None
 
-        threading.Thread(
-            target=lambda: process_chunk(self._client, self._buf, is_final=True),
-            daemon=True,
-        ).start()
+        if audio is not None:
+            threading.Thread(
+                target=self._transcribe_and_type, args=(audio,), daemon=True
+            ).start()
 
     def _on_audio(self, indata, frame_count, time_info, status):
         if status:
             log.warning("audio status: %s", status)
-        self._buf.append(indata)
+        with self._lock:
+            if self._active:
+                self._frames.append(indata.copy())
 
-    def _chunk_loop(self):
-        while True:
-            time.sleep(CHUNK_INTERVAL_S)
-            if not self._active:
+    def _transcribe_and_type(self, audio):
+        duration = len(audio) / SAMPLE_RATE
+        if duration < 0.3:
+            log.info("too short (%.1fs), skipping", duration)
+            set_title("talktype")
+            return
+
+        if is_silence(audio):
+            log.info("silent audio (peak=%d), skipping", np.max(np.abs(audio)))
+            set_title("talktype")
+            return
+
+        set_title("talktype [transcribing...]")
+        log.info("transcribing %.1fs...", duration)
+
+        try:
+            text = transcribe(self._client, audio)
+            if not text:
+                log.warning("empty transcription")
+                set_title("talktype")
                 return
-            process_chunk(self._client, self._buf, is_final=False)
+
+            log.info("got: %s", text)
+            keyboard.write(text + " ")
+            log.info("typed %d chars", len(text))
+            beep_done()
+
+        except Exception as e:
+            log.error("transcription failed: %s", e)
+            beep_error()
+
+        set_title("talktype")
 
 
 # --- Main ---
@@ -317,9 +222,9 @@ def main():
     session = RecordingSession(client)
 
     set_title("talktype")
-    log.info("talktype ready. Hold %s to record, text streams as you speak.", HOTKEY.upper())
+    log.info("talktype ready. Hold %s to record, release to transcribe.", HOTKEY.upper())
     log.info("Ctrl+C to quit.")
-    log.info("Language: %s | Chunk: %ds | Log: %s", LANGUAGE, CHUNK_INTERVAL_S, LOG_FILE)
+    log.info("Language: %s | Log: %s", LANGUAGE, LOG_FILE)
 
     keyboard.on_press_key(HOTKEY, lambda _: session.start(), suppress=True)
     keyboard.on_release_key(HOTKEY, lambda _: session.stop(), suppress=True)
