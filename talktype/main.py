@@ -2,7 +2,7 @@
 talktype — push-to-talk transcription.
 
 Hold F9 to record, release to transcribe. Text appears at your cursor.
-Key is suppressed so apps never see it. Ctrl+C to quit.
+Key is suppressed so apps never see it. Win+Q to quit.
 
 Requirements: pip install sounddevice openai keyboard numpy
 """
@@ -11,6 +11,7 @@ import io
 import os
 import sys
 import wave
+import queue
 import threading
 import logging
 import numpy as np
@@ -120,31 +121,43 @@ class RecordingSession:
 
     def __init__(self, client):
         self._client = client
-        self._frames = []
-        self._stream = None
-        self._active = False
+        self._active_session = None
+        self._transcribe_queue = queue.Queue()
         self._lock = threading.Lock()
+        self._worker = threading.Thread(target=self._transcribe_worker, daemon=True)
+        self._worker.start()
 
     def start(self):
         with self._lock:
-            if self._active:
+            if self._active_session is not None:
                 return
-            self._active = True
-            self._frames.clear()
 
-        try:
-            self._stream = sd.InputStream(
+            frames = []
+
+            def on_audio(indata, frame_count, time_info, status):
+                if status:
+                    log.warning("audio status: %s", status)
+                frames.append(indata.copy())
+
+            session = {"frames": frames, "stream": None}
+            try:
+                session["stream"] = sd.InputStream(
                 samplerate=SAMPLE_RATE,
                 channels=CHANNELS,
                 dtype="int16",
-                callback=self._on_audio,
-            )
-            self._stream.start()
-        except Exception as e:
-            log.error("recording start failed: %s", e)
-            with self._lock:
-                self._active = False
-            return
+                    callback=on_audio,
+                )
+                session["stream"].start()
+            except Exception as e:
+                if session["stream"] is not None:
+                    try:
+                        session["stream"].close()
+                    except Exception:
+                        pass
+                log.error("recording start failed: %s", e)
+                return
+
+            self._active_session = session
 
         set_title("talktype [RECORDING]")
         beep_start()
@@ -152,31 +165,37 @@ class RecordingSession:
 
     def stop(self):
         with self._lock:
-            if not self._active:
+            if self._active_session is None:
                 return
-            self._active = False
-            audio = np.concatenate(self._frames, axis=0) if self._frames else None
-            self._frames.clear()
+            session = self._active_session
+            self._active_session = None
 
-        if self._stream:
+        stream = session["stream"]
+        if stream is not None:
             try:
-                self._stream.stop()
-                self._stream.close()
+                stream.stop()
+            except Exception as e:
+                log.warning("stream stop failed: %s", e)
+            try:
+                stream.close()
             except Exception as e:
                 log.warning("stream close failed: %s", e)
-            self._stream = None
 
-        if audio is not None:
-            threading.Thread(
-                target=self._transcribe_and_type, args=(audio,), daemon=True
-            ).start()
+        frames = session["frames"]
+        if not frames:
+            log.warning("no audio captured")
+            set_title("talktype")
+            return
 
-    def _on_audio(self, indata, frame_count, time_info, status):
-        if status:
-            log.warning("audio status: %s", status)
-        with self._lock:
-            if self._active:
-                self._frames.append(indata.copy())
+        self._transcribe_queue.put(np.concatenate(frames, axis=0))
+
+    def _transcribe_worker(self):
+        while True:
+            audio = self._transcribe_queue.get()
+            try:
+                self._transcribe_and_type(audio)
+            finally:
+                self._transcribe_queue.task_done()
 
     def _transcribe_and_type(self, audio):
         duration = len(audio) / SAMPLE_RATE
@@ -225,16 +244,13 @@ def main():
 
     set_title("talktype")
     log.info("talktype ready. Hold %s to record, release to transcribe.", HOTKEY.upper())
-    log.info("Ctrl+C to quit.")
+    log.info("Win+Q to quit.")
     log.info("Language: %s | Log: %s", LANGUAGE, LOG_FILE)
 
     keyboard.on_press_key(HOTKEY, lambda _: session.start(), suppress=True)
     keyboard.on_release_key(HOTKEY, lambda _: session.stop(), suppress=True)
 
-    try:
-        keyboard.wait("ctrl+c")
-    except KeyboardInterrupt:
-        pass
+    keyboard.wait("windows+q")
     log.info("Bye.")
 
 
