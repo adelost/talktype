@@ -1,10 +1,16 @@
 """
 talktype — push-to-talk transcription.
 
-Hold F9 to record, release to transcribe. Text appears at your cursor.
-Key is suppressed so apps never see it. Win+Q to quit.
+Hold Ctrl + Mouse-Back to record, release to transcribe. Text appears
+at your cursor. Win+Q to quit.
 
-Requirements: pip install sounddevice openai keyboard numpy
+Why this combo: two-handed (Ctrl=left hand, mouse-back=right thumb),
+ergonomic for high-frequency use, no conflict with any default Windows
+shortcut. Trade-off: in browser, mouse-back may briefly fire navigate-
+back before talktype intercepts (selective suppress would need a
+WH_MOUSE_LL hook; not implemented).
+
+Requirements: pip install sounddevice openai keyboard pynput numpy
 """
 
 import io
@@ -17,11 +23,16 @@ import logging
 import numpy as np
 import sounddevice as sd
 import keyboard
+from pynput import mouse as pmouse
+from pynput import keyboard as pkb
 from openai import OpenAI
 
 # --- Config ---
 
-HOTKEY = "f9"
+# Mouse button to hold for push-to-talk. x1 = back button (most mice
+# with a thumb-side back/forward pair). Change to pmouse.Button.x2 for
+# the forward button.
+RECORD_BUTTON = pmouse.Button.x1
 SAMPLE_RATE = 16000
 CHANNELS = 1
 LANGUAGE = None  # None = auto-detect. Set to "sv", "en" etc. to force a language
@@ -243,14 +254,44 @@ def main():
     session = RecordingSession(client)
 
     set_title("talktype")
-    log.info("talktype ready. Hold %s to record, release to transcribe.", HOTKEY.upper())
+    log.info("talktype ready. Hold Ctrl + Mouse-Back to record, release to transcribe.")
     log.info("Win+Q to quit.")
     log.info("Language: %s | Log: %s", LANGUAGE, LOG_FILE)
 
-    keyboard.on_press_key(HOTKEY, lambda _: session.start(), suppress=True)
-    keyboard.on_release_key(HOTKEY, lambda _: session.stop(), suppress=True)
+    # Track Ctrl-state without suppressing keyboard input. We only need
+    # to know "is Ctrl held right now?" when the mouse button event fires.
+    ctrl_held = {"value": False}
 
-    keyboard.wait("windows+q")
+    def on_key_press(key):
+        if key in (pkb.Key.ctrl, pkb.Key.ctrl_l, pkb.Key.ctrl_r):
+            ctrl_held["value"] = True
+
+    def on_key_release(key):
+        if key in (pkb.Key.ctrl, pkb.Key.ctrl_l, pkb.Key.ctrl_r):
+            ctrl_held["value"] = False
+
+    def on_click(_x, _y, button, pressed):
+        if button != RECORD_BUTTON:
+            return
+        if pressed:
+            # Only arm recording when Ctrl was already held at click-down.
+            # Releasing the button mid-record always stops, regardless of
+            # whether Ctrl is still held — natural push-to-talk semantics.
+            if ctrl_held["value"]:
+                session.start()
+        else:
+            session.stop()
+
+    key_listener = pkb.Listener(on_press=on_key_press, on_release=on_key_release)
+    mouse_listener = pmouse.Listener(on_click=on_click)
+    key_listener.start()
+    mouse_listener.start()
+
+    try:
+        keyboard.wait("windows+q")
+    finally:
+        key_listener.stop()
+        mouse_listener.stop()
     log.info("Bye.")
 
 
