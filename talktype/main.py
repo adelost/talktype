@@ -1,16 +1,15 @@
 """
 talktype — push-to-talk transcription.
 
-Hold Ctrl + Mouse-Back to record, release to transcribe. Text appears
-at your cursor. Win+Q to quit.
+Two ways to trigger recording, both hold-to-record:
+- F9 (suppressed globally so apps never see the keypress)
+- Ctrl + Mouse-Back (click is swallowed by a low-level mouse hook so
+  browser-back doesn't fire; plain mouse-back without Ctrl still works)
 
-Why this combo: two-handed (Ctrl=left hand, mouse-back=right thumb),
-ergonomic for high-frequency use, no conflict with any default Windows
-shortcut. Trade-off: in browser, mouse-back may briefly fire navigate-
-back before talktype intercepts (selective suppress would need a
-WH_MOUSE_LL hook; not implemented).
+Release the trigger to transcribe. Text appears at your cursor.
+Win+Q to quit.
 
-Requirements: pip install sounddevice openai keyboard pynput numpy
+Requirements: pip install sounddevice openai keyboard numpy
 """
 
 import io
@@ -23,16 +22,20 @@ import logging
 import numpy as np
 import sounddevice as sd
 import keyboard
-from pynput import mouse as pmouse
-from pynput import keyboard as pkb
 from openai import OpenAI
+
+from .mouse_hook import CtrlMouseHook
 
 # --- Config ---
 
-# Mouse button to hold for push-to-talk. x1 = back button (most mice
-# with a thumb-side back/forward pair). Change to pmouse.Button.x2 for
-# the forward button.
-RECORD_BUTTON = pmouse.Button.x1
+# Keyboard hotkey for push-to-talk. Any key name accepted by the
+# `keyboard` library: f9, scroll_lock, pause, etc.
+HOTKEY = "f9"
+
+# Mouse-button paired with Ctrl for the second push-to-talk trigger.
+# 1 = back button (thumb side), 2 = forward button.
+RECORD_BUTTON_XBUTTON = 1
+
 SAMPLE_RATE = 16000
 CHANNELS = 1
 LANGUAGE = None  # None = auto-detect. Set to "sv", "en" etc. to force a language
@@ -254,44 +257,29 @@ def main():
     session = RecordingSession(client)
 
     set_title("talktype")
-    log.info("talktype ready. Hold Ctrl + Mouse-Back to record, release to transcribe.")
+    log.info("talktype ready. Hold %s OR Ctrl+Mouse-Back to record.", HOTKEY.upper())
     log.info("Win+Q to quit.")
     log.info("Language: %s | Log: %s", LANGUAGE, LOG_FILE)
 
-    # Track Ctrl-state without suppressing keyboard input. We only need
-    # to know "is Ctrl held right now?" when the mouse button event fires.
-    ctrl_held = {"value": False}
+    # F9: keyboard library suppresses the keypress globally so apps
+    # never see it. Like push-to-talk in Discord/Ventrilo.
+    keyboard.on_press_key(HOTKEY, lambda _: session.start(), suppress=True)
+    keyboard.on_release_key(HOTKEY, lambda _: session.stop(), suppress=True)
 
-    def on_key_press(key):
-        if key in (pkb.Key.ctrl, pkb.Key.ctrl_l, pkb.Key.ctrl_r):
-            ctrl_held["value"] = True
-
-    def on_key_release(key):
-        if key in (pkb.Key.ctrl, pkb.Key.ctrl_l, pkb.Key.ctrl_r):
-            ctrl_held["value"] = False
-
-    def on_click(_x, _y, button, pressed):
-        if button != RECORD_BUTTON:
-            return
-        if pressed:
-            # Only arm recording when Ctrl was already held at click-down.
-            # Releasing the button mid-record always stops, regardless of
-            # whether Ctrl is still held — natural push-to-talk semantics.
-            if ctrl_held["value"]:
-                session.start()
-        else:
-            session.stop()
-
-    key_listener = pkb.Listener(on_press=on_key_press, on_release=on_key_release)
-    mouse_listener = pmouse.Listener(on_click=on_click)
-    key_listener.start()
-    mouse_listener.start()
+    # Ctrl+Mouse-Back: low-level WH_MOUSE_LL hook conditionally suppresses
+    # the click only when Ctrl is held, so plain mouse-back still works
+    # for browser navigation when not recording.
+    mouse_hook = CtrlMouseHook(
+        x_button=RECORD_BUTTON_XBUTTON,
+        on_press=session.start,
+        on_release=session.stop,
+    )
+    mouse_hook.start()
 
     try:
         keyboard.wait("windows+q")
     finally:
-        key_listener.stop()
-        mouse_listener.stop()
+        mouse_hook.stop()
     log.info("Bye.")
 
 
